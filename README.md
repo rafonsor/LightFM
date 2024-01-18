@@ -1,2 +1,2 @@
 # LightFM
-LightFM reimplementation in PyTorch
+LightFM reimplementation in PyTorch using sparse tensors.
