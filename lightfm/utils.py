@@ -1,9 +1,14 @@
+import typing as t
+
 import torch as pt
 
 __all__ = [
     "sparse_eye",
     "sparse_identity",
 ]
+
+SparseCOOTensorT: t.TypeAlias = pt.Tensor  # pt.layout = pt.sparse_coo
+SparseCSRTensorT: t.TypeAlias = pt.Tensor  # pt.layout = pt.sparse_csr
 
 
 def sparse_identity(n: int, layout: str = "csr", requires_grad: bool = True) -> pt.sparse.Tensor:
@@ -18,3 +23,25 @@ def sparse_identity(n: int, layout: str = "csr", requires_grad: bool = True) -> 
 
 
 sparse_eye = sparse_identity
+
+
+class SparseTensorDataset(pt.utils.data.Dataset):
+    def __init__(self, inputs: pt.Tensor, targets: t.Optional[pt.Tensor] = None):
+        if targets is not None:
+            assert inputs.values().numel() == targets.numel(), \
+                'Inputs and targets must align in size.'
+        self._data = inputs.to_sparse_coo()
+        self._values: pt.Tensor = inputs.values()
+        self._targets = targets
+
+    def __len__(self) -> int:
+        return self._values.shape[0]
+
+    def __getitem__(self, idx: int) -> t.Tuple[pt.Tensor, ...]:
+        # Let out of bounds error be implicit when idx >= len(self).
+        row, col = self._data.indices()[:, idx]
+        value = self._values[idx]
+        if self._targets is None:
+            return row, col, value
+        target = self._targets[idx]
+        return row, col, value, target
