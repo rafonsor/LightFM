@@ -3,6 +3,9 @@ import typing as t
 import torch as pt
 
 __all__ = [
+    "SparseTensorDataset",
+    "SparseCOOTensorT",
+    "SparseCSRTensorT",
     "sparse_eye",
     "sparse_identity",
 ]

@@ -18,14 +18,26 @@ def get_representation(
 
 
 class LightFMOptimizer:
-    pass
+    @pt.no_grad()
+    def step(
+            self,
+            loss: pt.Tensor,
+            user_features: SparseCSRTensorT,
+            item_features: SparseCSRTensorT,
+            user_id: int,
+            positive_item_id: int,
+            negative_item_id: int
+    ) -> None:
+        raise NotImplementedError('@pt.no_grad() def step(...) -> None')
+
+    def zero_grad(self):
+        pass  # no-op, parameters do not require gradient backpropagation
 
 
 class AdagradOptimizer(LightFMOptimizer):
     """Stochastic Adagrad learning rule.
 
     Note: this is a like-for-like re-implementation of the Adagrad variant used in LightFM's library
-
     """
     def __init__(
             self,
@@ -64,7 +76,7 @@ class AdagradOptimizer(LightFMOptimizer):
             param_name: str,
             feature_index: pt.Tensor,
             feature_weights: pt.Tensor,
-            loss: float
+            loss: pt.Tensor
     ) -> float:
         # Update first gradient moments
         gradients = self.state[param_name]['gradients'][feature_index]
@@ -78,7 +90,7 @@ class AdagradOptimizer(LightFMOptimizer):
 
     def _step_warp(
             self,
-            loss: float,
+            loss: pt.Tensor,
             user_features: SparseCSRTensorT,
             item_features: SparseCSRTensorT,
             user_id: int,
@@ -149,7 +161,7 @@ class AdagradOptimizer(LightFMOptimizer):
     @pt.no_grad()
     def step(
             self,
-            loss: float,
+            loss: pt.Tensor,
             user_features: SparseCSRTensorT,
             item_features: SparseCSRTensorT,
             user_id: int,
