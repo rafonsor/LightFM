@@ -14,7 +14,7 @@ __all__ = [
 def get_representation(
         feature_vector: pt.sparse.Tensor, embeddings: pt.nn.Parameter, scale: pt.nn.Parameter
 ) -> pt.sparse.Tensor:
-    return pt.sparse.mm(feature_vector * scale, embeddings)
+    return (feature_vector * scale) @ embeddings
 
 
 class LightFMOptimizer:
@@ -80,12 +80,12 @@ class AdagradOptimizer(LightFMOptimizer):
     ) -> float:
         # Update first gradient moments
         gradients = self.state[param_name]['gradients'][feature_index]
-        local_learning_rates = self.defaults['lr'] / gradients.sqrt(dim=1)
-        gradients.add_((loss * feature_weights) ** 2)
+        local_learning_rates = self.defaults['lr'] / gradients.sqrt()
+        gradients.add_(((loss * feature_weights) ** 2))
         # Update parameter and scale using regularization parameter
-        param = self.params[param_name]
-        param[feature_index].addcmul_(feature_weights, loss, value=-local_learning_rates)
-        param[feature_index].mul_(1.0 + self.defaults['weight_decay'] * local_learning_rates)
+        param = self.params[param_name][feature_index]
+        param.add_(-local_learning_rates * loss * feature_weights)
+        param.mul_(1.0 + self.defaults['weight_decay'] * local_learning_rates)
         return local_learning_rates.sum().item()
 
     def _step_warp(
@@ -112,17 +112,17 @@ class AdagradOptimizer(LightFMOptimizer):
         user_repr = get_representation(
             user_feature_vector, self.params['user_embeddings'], self.params['user_scale'])
 
-        pos_item_feature_index = pos_item_feature_vector.indices()
-        pos_item_feature_weights = pos_item_feature_vector.values()
-        neg_item_feature_index = neg_item_feature_vector.indices()
-        neg_item_feature_weights = neg_item_feature_vector.values()
-        user_feature_index = user_feature_vector.indices()
-        user_feature_weights = user_feature_vector.values()
+        pos_item_feature_index = pos_item_feature_vector.indices().squeeze()
+        pos_item_feature_weights = pos_item_feature_vector.values().unsqueeze(1)
+        neg_item_feature_index = neg_item_feature_vector.indices().squeeze()
+        neg_item_feature_weights = neg_item_feature_vector.values().unsqueeze(1)
+        user_feature_index = user_feature_vector.indices().squeeze()
+        user_feature_weights = user_feature_vector.values().unsqueeze(1)
         del pos_item_feature_vector, neg_item_feature_vector, user_feature_vector
 
         # Update latent bias terms
         avg_learning_rate = self._update_parameter(
-            'item_biases', pos_item_feature_index, neg_item_feature_weights, -loss)
+            'item_biases', pos_item_feature_index, pos_item_feature_weights, -loss)
         avg_learning_rate += self._update_parameter(
             'item_biases', neg_item_feature_index, neg_item_feature_weights, loss)
         avg_learning_rate += self._update_parameter(

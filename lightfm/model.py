@@ -36,8 +36,8 @@ class LightFM(pt.nn.Module):
 
         self.item_embeddings: pt.nn.Parameter  # n_item_features x n_components
         self.user_embeddings: pt.nn.Parameter  # n_user_features x n_components
-        self.item_biases: pt.nn.Parameter  # n_item_features
-        self.user_biases: pt.nn.Parameter  # n_user_features
+        self.item_biases: pt.nn.Parameter  # n_item_features x 1
+        self.user_biases: pt.nn.Parameter  # n_user_features x 1
         self.user_scale: pt.nn.Parameter  # 1
         self.item_scale: pt.nn.Parameter  # 1
         self._init_parameters()
@@ -52,8 +52,8 @@ class LightFM(pt.nn.Module):
                                                                  self.n_components)))
         self.user_embeddings = pt.nn.Parameter(scaled_zero_mean((self.n_user_features,
                                                                  self.n_components)))
-        self.item_biases = pt.nn.Parameter(pt.zeros(self.n_item_features))
-        self.user_biases = pt.nn.Parameter(pt.zeros(self.n_user_features))
+        self.item_biases = pt.nn.Parameter(pt.zeros(self.n_item_features, 1))
+        self.user_biases = pt.nn.Parameter(pt.zeros(self.n_user_features, 1))
         self.user_scale = pt.nn.Parameter(pt.tensor(1.0), requires_grad=False)
         self.item_scale = pt.nn.Parameter(pt.tensor(1.0), requires_grad=False)
 
@@ -179,12 +179,16 @@ class LightFMTrainer:
         self.loss = loss
 
         if random_state is not None:
-            pt.set_rng_state(pt.tensor(random_state))
+            pt.manual_seed(random_state)
 
         self._model: LightFM
         self._optimizer: t.Union[pt.optim.Optimizer, LightFMOptimizer]
         self._trained = False
         self._reset_state()
+
+    @property
+    def model(self) -> LightFM:
+        return self._model
 
     def _reset_state(self):
         """Reset model and optimizer state"""
@@ -225,18 +229,18 @@ class LightFMTrainer:
             dict(self._model.named_parameters()), n_components=self.n_components, **kwargs)
 
     @staticmethod
-    def _progress(n, verbose, desc: str = 'Epoch', level: int = 0):
+    def _progress(seq, verbose, desc: str = 'Epoch', level: int = 0):
         if not verbose:
-            return range(n)
+            return seq
         try:
-            from tqdm import trange
-            return trange(n, desc=desc, leave=not level, level=level)
+            from tqdm import tqdm
+            return tqdm(seq, desc=desc, leave=not level, position=level)
         except ImportError:
-            def verbose_range():
-                for i in range(n):
+            def verbose_iteration():
+                for i, elem in enumerate(seq):
                     print(f"{desc} {i}")
-                    yield i
-            return verbose_range()
+                    yield elem
+            return verbose_iteration()
 
     @staticmethod
     def _check_input_finite(data):
@@ -372,8 +376,10 @@ class LightFMTrainer:
         else:
             raise NotImplementedError(f"Loss {self.loss} not yet implemented. Use 'warp'.")
 
+        # Feed-in single samples directly
         trainset = SparseTensorDataset(interactions, sample_weights)
-        data_loader = pt.utils.data.DataLoader(trainset, batch_size=1, shuffle=True)
+        data_loader = pt.utils.data.DataLoader(
+            trainset, batch_size=1, shuffle=True, collate_fn=lambda x: x[0])
 
         epoch_loss = sum(
             fit_sample_fn(positive_sample, interactions, user_features, item_features)
@@ -381,9 +387,6 @@ class LightFMTrainer:
             in self._progress(data_loader, verbose=verbose, desc='Sample', level=1)
         )
         self._regularize()  # L2 regularisation
-
-        if verbose:
-            print(f"Epoch loss: {epoch_loss}")
         return epoch_loss
 
     def _fit_sample_warp(
@@ -392,7 +395,7 @@ class LightFMTrainer:
             interactions: SparseCOOTensorT,
             user_features: SparseCSRTensorT,
             item_features: SparseCSRTensorT,
-    ):
+    ) -> float:
         """
         Fit the model using the WARP loss.
 
@@ -408,19 +411,23 @@ class LightFMTrainer:
             the item at hand. If such occurs within at most `max_sampled` tries, this leads to
             tweaking model parameters such that users with similar features get closer in the latent
             space to items with observed interactions.
+
+        Returns
+        -------
+        Sample loss
         """
         user_id, item_id, value, weight = positive_sample
         n_items = item_features.shape[0]
 
         if value <= 0:
-            return  # Skip negative-values samples
+            return 0.0 # Skip negative-values samples
 
         user_feature_vector = user_features[user_id]
         item_feature_vector = item_features[item_id]
         positive_score = self._model.predict(user_feature_vector, item_feature_vector)
 
         for rank in range(self.max_sampled):
-            negative_item_id = pt.randint(0, n_items)
+            negative_item_id = pt.randint(0, n_items, (1,)).squeeze()
 
             if pt.is_nonzero(interactions[user_id, negative_item_id]):
                 continue  # Skip item with existing interactions from this user
@@ -455,7 +462,8 @@ class LightFMTrainer:
 
             if self.item_scale > MAX_REG_SCALE or self.user_scale > MAX_REG_SCALE:
                 self._regularize()
-            break
+            return loss.item()
+        return 0.0
 
     def fit(
         self,
@@ -465,7 +473,7 @@ class LightFMTrainer:
         sample_weights: t.Optional[SparseCOOTensorT] = None,
         epochs: int = 10,
         verbose: bool = False,
-    ):
+    ) -> t.List[float]:
         """
         Fit the model.
 
@@ -495,8 +503,8 @@ class LightFMTrainer:
 
         Returns
         -------
-        LightFM instance
-            the fitted model
+        List[float]
+            A list of epoch losses (sum of all sample losses)
         """
         # Discard old results, if any
         self._reset_state()
@@ -518,7 +526,7 @@ class LightFMTrainer:
         sample_weights: t.Optional[SparseCOOTensorT] = None,
         epochs: int = 1,
         verbose: bool = False,
-    ):
+    ) -> t.List[float]:
         """
         Fit the model.
 
@@ -550,8 +558,8 @@ class LightFMTrainer:
 
         Returns
         -------
-        LightFM instance
-            the fitted model
+        List[float]
+            A list of epoch losses (sum of all sample losses)
         """
         if len(interactions.shape) != 2:
             raise ValueError("Incorrect interactions dimension, expected (n_users, n_items).")
@@ -573,9 +581,39 @@ class LightFMTrainer:
         if not user_features.shape[1] == self._model.user_embeddings.shape[0]:
             raise ValueError("Incorrect number of features in user_features")
 
-        for _ in self._progress(epochs, verbose=verbose):
-            self._run_epoch(interactions, user_features, item_features, sample_weight_data, verbose)
+        epoch_losses = []
+        for _ in self._progress(range(epochs), verbose=verbose):
+            loss = self._run_epoch(
+                interactions, user_features, item_features, sample_weight_data, verbose)
             self._check_parameters_finite()
+            epoch_losses.append(loss)
 
         self._trained = True
-        return self
+        return epoch_losses
+
+
+if __name__ == '__main__':
+    n_user_features = 20
+    n_item_features = 15
+    trainer = LightFMTrainer(
+        n_user_features=n_user_features,
+        n_item_features=n_item_features,
+        n_components=10,
+        learning_schedule='adagrad',
+        loss='warp',
+        learning_rate=0.05,
+        random_state=42
+    )
+
+    n_users = 1000
+    n_items = 1000
+    interactions = (pt.randint(0, 55, (n_users, n_items))/100).round().to_sparse_coo()
+    user_features = pt.rand(n_users, n_user_features).round().to_sparse_csr()
+    item_features = pt.rand(n_items, n_item_features).round().to_sparse_csr()
+    epoch_losses = trainer.fit(
+        interactions,
+        user_features,
+        item_features,
+        epochs=20,
+        verbose=True
+    )
