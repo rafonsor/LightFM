@@ -30,6 +30,21 @@ class LightFMOptimizer:
     ) -> None:
         raise NotImplementedError('@pt.no_grad() def step(...) -> None')
 
+    @pt.no_grad()
+    def step_batch(
+            self,
+            losses: pt.Tensor,
+            user_features: SparseCSRTensorT,
+            item_features: SparseCSRTensorT,
+            user_ids: int,
+            positive_item_ids: int,
+            negative_item_ids: int,
+            user_reprs: pt.Tensor,
+            pos_item_reprs: pt.Tensor,
+            neg_item_reprs: pt.Tensor,
+    ) -> None:
+        raise NotImplementedError('@pt.no_grad() def step_batch(...) -> None')
+
     def zero_grad(self):
         pass  # no-op, parameters do not require gradient backpropagation
 

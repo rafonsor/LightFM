@@ -610,13 +610,254 @@ class LightFMTrainer:
         return epoch_losses
 
 
+class MiniBatchTrainer(LightFMTrainer):
+    def __init__(
+        self,
+        n_user_features: int,
+        n_item_features: int,
+        n_components: int = 10,
+        batch_size: int = 1024,
+        kos_k: int = 5,  # k-th positive sample to used during each k-OS update
+        kos_max: int = 10,  # maximum number of interactions to sample each k-OS update
+        learning_schedule: str = "adagrad",
+        builtin_optimizer: bool = False,
+        loss: str = "warp",
+        learning_rate: float = 0.05,
+        rho: float = 0.95,
+        epsilon: float = 1e-6,
+        alpha: float = 0.0,  # Common alpha for user/item feature parameters (i.e. weight decay)
+        max_sampled: int = 10,
+        random_state: t.Optional[int] = None,
+    ):
+        assert batch_size > 0
+        super().__init__(n_user_features, n_item_features, n_components, kos_k, kos_max,
+                         learning_schedule, builtin_optimizer, loss, learning_rate, rho, epsilon,
+                         alpha, max_sampled, random_state)
+        self.batch_size = batch_size
+
+    def fit_partial(
+        self,
+        interactions: SparseCOOTensorT,
+        user_features: t.Optional[SparseCSRTensorT] = None,
+        item_features: t.Optional[SparseCSRTensorT] = None,
+        sample_weights: t.Optional[SparseCOOTensorT] = None,
+        epochs: int = 1,
+        verbose: bool = False,
+    ) -> t.List[float]:
+        """
+        Fit the model.
+
+        Unlike fit, repeated calls to this method will cause training to resume from the current
+        model state.
+
+        For details on how to use feature matrices, see the documentation on the
+        :class:`lightfm.LightFM` class.
+
+        Arguments
+        ---------
+        interactions: pt.Tensor of layout sparse_coo and shape [n_users, n_items]
+             the matrix containing
+             user-item interactions. Will be converted to
+             numpy.float32 dtype if it is not of that type.
+        user_features: pt.Tensor of layout sparse_csr and shape [n_users, n_user_features], optional
+             Each row contains that user's weights over features.
+        item_features: pt.Tensor of layout sparse_csr and shape [n_items, n_item_features], optional
+             Each row contains that item's weights over features.
+        sample_weights: pt.Tensor of layout sparse_coo and shape [n_users, n_items], optional
+             matrix with entries expressing weights of individual interactions from the interactions
+            matrix. Its row and col arrays must be the same as those of the interactions matrix. For
+            memory efficiency its possible to use the same arrays for both weights and interaction
+            matrices. Defaults to weight 1.0 for all interactions. Not implemented for k-OS loss.
+        epochs: int, optional
+             number of epochs to run
+        verbose: bool, optional
+             Report on training progress using `tqdm` if available, otherwise uses iterative prints.
+
+        Returns
+        -------
+        List[float]
+            A list of epoch losses (sum of all sample losses)
+        """
+        if len(interactions.shape) != 2:
+            raise ValueError("Incorrect interactions dimension, expected (n_users, n_items).")
+
+        n_users, n_items = interactions.shape
+        interactions = interactions.to_sparse_coo().type(pt.float)
+
+        sample_weight_data = self._process_sample_weights(interactions, sample_weights)
+
+        (user_features, item_features) = self._construct_feature_matrices(
+            n_users, n_items, user_features, item_features)
+
+        for input_data in (user_features, item_features, interactions, sample_weight_data):
+            self._check_input_finite(input_data)
+
+        # Check that the dimensionality of the feature matrices has not changed between runs.
+        if not item_features.shape[1] == self._model.item_embeddings.shape[0]:
+            raise ValueError("Incorrect number of features in item_features")
+        if not user_features.shape[1] == self._model.user_embeddings.shape[0]:
+            raise ValueError("Incorrect number of features in user_features")
+
+        trainset = SparseTensorDataset(interactions, sample_weight_data)
+        data_loader = pt.utils.data.DataLoader(
+            trainset, batch_size=self.batch_size, shuffle=True, drop_last=True)
+
+        epoch_losses = []
+        for _ in self._progress(range(epochs), verbose=verbose):
+            # with pt.profiler.profile(profile_memory=True) as prof:
+                loss = self._run_epoch(
+                    data_loader, interactions, user_features, item_features, verbose)
+                self._check_parameters_finite()
+                epoch_losses.append(loss)
+            # print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=-1))
+            # breakpoint()
+        self._trained = True
+        return epoch_losses
+
+    def _run_epoch(
+            self,
+            data_loader: pt.utils.data.DataLoader,
+            interactions: SparseCOOTensorT,
+            user_features: t.Optional[SparseCSRTensorT],
+            item_features: t.Optional[SparseCSRTensorT],
+            verbose: bool = False,
+    ):
+        """Fit the model
+
+        Parameters
+        ----------
+        data_loader: pt.utils.data.DataLoader
+            Minibatch sampler and feeder for weighted interactions.
+        interactions: pt.Tensor of layout sparse_coo and shape [n_users, n_items]
+            the matrix containing user-item interactions.
+        user_features: pt.Tensor of layout sparse_csr and shape [n_users, n_user_features], optional
+            Each row contains that user's weights over features.
+        item_features: pt.Tensor of layout sparse_csr and shape [n_items, n_item_features], optional
+            Each row contains that item's weights over features.
+        verbose: bool
+            Whether to print training progress
+        """
+        self._model.train()
+        if self.loss == 'warp':
+            fit_batch_fn = self._fit_batch_warp
+        else:
+            raise NotImplementedError(f"Loss {self.loss} not yet implemented. Use 'warp'.")
+
+        epoch_loss = sum(
+            fit_batch_fn(positive_batch, interactions, user_features, item_features)
+            for positive_batch
+            in self._progress(data_loader, verbose=verbose, desc='Sample', level=1)
+        )
+        self._regularize()  # L2 regularisation
+        return epoch_loss
+
+    def _fit_batch_warp(
+            self,
+            positive_batch: t.Tuple[pt.Tensor, ...],
+            interactions: SparseCOOTensorT,
+            user_features: SparseCSRTensorT,
+            item_features: SparseCSRTensorT,
+    ) -> float:
+        """
+        Fit the model using the WARP loss.
+
+        Weighted Approximate-Rank Pairwise (WARP) loss: Maximises the rank of positive examples by
+        repeatedly sampling negative examples until a rank-violating one is found. Useful when only
+        positive interactions are present and optimising the top of the recommendation list
+        (precision@k) is desired.
+
+
+        WARP Training follows adaptive stochastic gradient descent with contrastive learning:
+            for all interactions, we individually and iteratively search for situations where the
+            model assigns higher scores to items a specific user has not interacted with compare to
+            the item at hand. If such occurs within at most `max_sampled` tries, this leads to
+            tweaking model parameters such that users with similar features get closer in the latent
+            space to items with observed interactions.
+
+        Returns
+        -------
+        Sample loss
+        """
+        user_ids, item_ids, values, weights = positive_batch
+        n_items = item_features.shape[0]
+
+        user_feature_vectors = pt.stack([user_features[uid] for uid in user_ids])
+        all_scores, user_reprs, all_item_reprs = self._model(
+            user_feature_vectors, item_features, return_repr=True
+        )
+
+        sampled_items = pt.randint(0, n_items, (self.batch_size, self.max_sampled))
+        losses = pt.zeros(self.batch_size, dtype=pt.float)
+        found = pt.zeros(self.batch_size, dtype=pt.bool)
+        neg_item_ids = pt.empty_like(item_ids)
+
+        # Search for rank infringements across user batch
+        for idx, (uid, positive_item_id) in enumerate(zip(user_ids, item_ids)):
+            for rank in range(self.max_sampled):
+                if found[idx]:
+                    continue
+
+                negative_item_id = sampled_items[idx, rank]
+
+                if pt.is_nonzero(interactions[uid, negative_item_id]):
+                    continue  # Skip item with existing interactions from this user
+
+                if all_scores[uid, negative_item_id] < all_scores[idx, positive_item_id]:
+                    continue  # No violation
+
+                # Compute WARP loss
+                losses[idx] = self._warp_loss(rank + 1, weights[idx], n_items).clip_(max=MAX_LOSS)
+
+                # Save conflicting item
+                neg_item_ids[idx] = negative_item_id
+                found[idx] = True
+                break
+
+        # Condense losses to apply. That is, only retain batch samples where found[:] is True.
+        idcs = pt.nonzero(found).squeeze()
+        user_ids = user_ids[idcs]
+        pos_item_ids = item_ids[idcs]
+        neg_item_ids = neg_item_ids[idcs]
+        user_reprs = user_reprs[idcs]
+        pos_item_reprs = all_item_reprs[pos_item_ids]
+        neg_item_reprs = all_item_reprs[neg_item_ids]
+        losses = losses[idcs]
+
+        # Apply Adaptive update rule with WARP losses
+        if isinstance(self._optimizer, pt.optim.Optimizer):
+            self._optimizer.zero_grad()
+            losses.sum().backward()
+            self._optimizer.step()
+        else:
+            self._optimizer.step_batch(
+                losses,
+                user_features,
+                item_features,
+                user_ids,
+                pos_item_ids,
+                neg_item_ids,
+                user_reprs,
+                pos_item_reprs,
+                neg_item_reprs,
+            )
+
+        if self.item_scale > MAX_REG_SCALE or self.user_scale > MAX_REG_SCALE:
+            self._regularize()
+        return losses.sum().item()
+
+
+class DistributedTrainer:
+    pass
+
+
 if __name__ == '__main__':
     n_user_features = 20
     n_item_features = 15
-    trainer = LightFMTrainer(
+    # trainer = LightFMTrainer(
+    trainer = MiniBatchTrainer(
         n_user_features=n_user_features,
         n_item_features=n_item_features,
-        n_components=10,
+        n_components=100,
         learning_schedule='adagrad',
         loss='warp',
         learning_rate=0.05,
@@ -628,6 +869,9 @@ if __name__ == '__main__':
     interactions = (pt.randint(0, 55, (n_users, n_items))/100).round().to_sparse_coo()
     user_features = pt.rand(n_users, n_user_features).round().to_sparse_csr()
     item_features = pt.rand(n_items, n_item_features).round().to_sparse_csr()
+
+    # pt.set_num_threads(10)
+    # pt.set_num_interop_threads(10)
     epoch_losses = trainer.fit(
         interactions,
         user_features,
