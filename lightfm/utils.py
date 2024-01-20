@@ -34,7 +34,8 @@ class SparseTensorDataset(pt.utils.data.Dataset):
             assert inputs.values().numel() == targets.numel(), \
                 'Inputs and targets must align in size.'
         self._data = inputs.to_sparse_coo()
-        self._values: pt.Tensor = inputs.values()
+        self._indices: pt.Tensor = self._data.indices()
+        self._values: pt.Tensor = self._data.values()
         self._targets = targets
 
     def __len__(self) -> int:
@@ -42,7 +43,7 @@ class SparseTensorDataset(pt.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> t.Tuple:
         # Let out of bounds error be implicit when idx >= len(self).
-        row, col = self._data.indices()[:, idx].squeeze()
+        row, col = self._indices[:, idx].view(-1)
         value = self._values[idx]
         if self._targets is None:
             return row, col, value

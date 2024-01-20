@@ -57,7 +57,12 @@ class LightFM(pt.nn.Module):
         self.user_scale = pt.nn.Parameter(pt.tensor(1.0), requires_grad=False)
         self.item_scale = pt.nn.Parameter(pt.tensor(1.0), requires_grad=False)
 
-    def forward(self, users_features: pt.Tensor, items_features: pt.Tensor) -> pt.Tensor:
+    def forward(
+            self,
+            users_features: pt.Tensor,
+            items_features: pt.Tensor,
+            return_repr: bool = False
+    ) -> t.Union[pt.Tensor, t.Tuple[pt.Tensor, ...]]:
         """Predict scores for user-item pairs
 
         Parameters
@@ -66,7 +71,8 @@ class LightFM(pt.nn.Module):
             Feature vectors for a group of users
         items_features: pt.Tensor
             Feature vectors for a group of items
-
+        return_repr: t.Tuple
+            Return latent representations
         Returns
         -------
         scores: pt.Tensor
@@ -82,9 +88,17 @@ class LightFM(pt.nn.Module):
         items_repr = pt.sparse.mm(scaled_items_features, self.item_embeddings)
         user_biases = pt.sparse.mm(scaled_users_features, self.user_biases)
         item_biases = pt.sparse.mm(scaled_items_features, self.item_biases)
-        return pt.mm(users_repr, items_repr.T) + user_biases[:, None] + item_biases[None, :]
+        scores = pt.mm(users_repr, items_repr.T) + user_biases[:, 0, None] + item_biases[None, :, 0]
+        if return_repr:
+            return scores, users_repr, items_repr
+        return scores
 
-    def predict(self, user_features: pt.Tensor, item_features: pt.Tensor) -> float:
+    def predict(
+            self,
+            user_features: pt.Tensor,
+            item_features: pt.Tensor,
+            return_repr: bool = False
+    ) -> t.Union[float, t.Tuple[pt.Tensor, ...]]:
         """Predict scores for a single user-item pair
 
         Parameters
@@ -93,13 +107,18 @@ class LightFM(pt.nn.Module):
             Feature vectors for a group of users
         item_features: pt.Tensor
             Feature vectors for a group of items
-
+        return_repr: t.Tuple
+            Return latent representations
         Returns
         -------
         scores: pt.Tensor
             Predicted scores for user-item pairs
         """
-        return self.forward(user_features.unsqueeze(0), item_features.unsqueeze(0)).item()
+        output = self.forward(user_features.unsqueeze(0), item_features.unsqueeze(0),
+                              return_repr=return_repr)
+        if return_repr:
+            return output[0], *output[1:]
+        return output.item()
 
     def recommend(self, k: int, users_features: pt.Tensor, items_features: pt.Tensor) -> pt.Tensor:
         """Recommend Top-K items for the provided users
@@ -330,10 +349,10 @@ class LightFMTrainer:
         Apply accumulated L2 regularization to all latent space features.
         """
         # Scale down latent space features
-        self._model.item_embeddings.div_(self._model.item_scale)
-        self._model.item_biases.div_(self._model.item_scale)
-        self._model.user_embeddings.div_(self._model.user_scale)
-        self._model.user_biases.div_(self._model.user_scale)
+        self._model.item_embeddings /= self._model.item_scale
+        self._model.item_biases /= self._model.item_scale
+        self._model.user_embeddings /= self._model.user_scale
+        self._model.user_biases /= self._model.user_scale
         # Reset scaling factors
         self._model.item_scale.fill_(1.0)
         self._model.user_scale.fill_(1.0)
@@ -344,10 +363,10 @@ class LightFMTrainer:
 
     def _run_epoch(
             self,
+            data_loader: pt.utils.data.DataLoader,
             interactions: SparseCOOTensorT,
             user_features: t.Optional[SparseCSRTensorT],
             item_features: t.Optional[SparseCSRTensorT],
-            sample_weights: t.Optional[SparseCOOTensorT],
             verbose: bool = False,
     ):
         """Fit the model
@@ -375,11 +394,6 @@ class LightFMTrainer:
             fit_sample_fn = self._fit_sample_warp
         else:
             raise NotImplementedError(f"Loss {self.loss} not yet implemented. Use 'warp'.")
-
-        # Feed-in single samples directly
-        trainset = SparseTensorDataset(interactions, sample_weights)
-        data_loader = pt.utils.data.DataLoader(
-            trainset, batch_size=1, shuffle=True, collate_fn=lambda x: x[0])
 
         epoch_loss = sum(
             fit_sample_fn(positive_sample, interactions, user_features, item_features)
@@ -424,7 +438,8 @@ class LightFMTrainer:
 
         user_feature_vector = user_features[user_id]
         item_feature_vector = item_features[item_id]
-        positive_score = self._model.predict(user_feature_vector, item_feature_vector)
+        positive_score, user_repr, item_repr = self._model.predict(
+            user_feature_vector, item_feature_vector, return_repr=True)
 
         for rank in range(self.max_sampled):
             negative_item_id = pt.randint(0, n_items, (1,)).squeeze()
@@ -433,17 +448,13 @@ class LightFMTrainer:
                 continue  # Skip item with existing interactions from this user
 
             negative_item_feature_vector = item_features[negative_item_id]
-            negative_score = self._model.predict(user_feature_vector, negative_item_feature_vector)
+            negative_score, _, neg_item_repr = self._model.predict(user_feature_vector, negative_item_feature_vector, return_repr=True)
 
             if negative_score < positive_score:
                 continue  # No violation
 
-            # Compute WARP loss
-            loss = self._warp_loss(rank + 1, weight, n_items)
-
-            # Clip for numerical stability
-            if loss > MAX_LOSS:
-                loss.clip_(max=MAX_LOSS)
+            # Compute WARP loss, clipped for numerical stability
+            loss = self._warp_loss(rank + 1, weight, n_items).clip_(max=MAX_LOSS)
 
             if isinstance(self._optimizer, pt.optim.Optimizer):
                 self._optimizer.zero_grad()
@@ -457,7 +468,10 @@ class LightFMTrainer:
                     item_features,
                     user_id,
                     item_id,
-                    negative_item_id
+                    negative_item_id,
+                    user_repr,
+                    item_repr,
+                    neg_item_repr,
                 )
 
             if self.item_scale > MAX_REG_SCALE or self.user_scale > MAX_REG_SCALE:
@@ -581,13 +595,17 @@ class LightFMTrainer:
         if not user_features.shape[1] == self._model.user_embeddings.shape[0]:
             raise ValueError("Incorrect number of features in user_features")
 
+        # Feed-in single samples directly
+        trainset = SparseTensorDataset(interactions, sample_weight_data)
+        data_loader = pt.utils.data.DataLoader(
+            trainset, batch_size=1, shuffle=True, collate_fn=lambda x: x[0])
+
         epoch_losses = []
         for _ in self._progress(range(epochs), verbose=verbose):
             loss = self._run_epoch(
-                interactions, user_features, item_features, sample_weight_data, verbose)
+                data_loader, interactions, user_features, item_features, verbose)
             self._check_parameters_finite()
             epoch_losses.append(loss)
-
         self._trained = True
         return epoch_losses
 

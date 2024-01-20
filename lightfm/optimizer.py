@@ -81,11 +81,11 @@ class AdagradOptimizer(LightFMOptimizer):
         # Update first gradient moments
         gradients = self.state[param_name]['gradients'][feature_index]
         local_learning_rates = self.defaults['lr'] / gradients.sqrt()
-        gradients.add_(((loss * feature_weights) ** 2))
+        gradients += (loss * feature_weights) ** 2
         # Update parameter and scale using regularization parameter
         param = self.params[param_name][feature_index]
-        param.add_(-local_learning_rates * loss * feature_weights)
-        param.mul_(1.0 + self.defaults['weight_decay'] * local_learning_rates)
+        param -= local_learning_rates * loss * feature_weights
+        param *= 1.0 + self.defaults['weight_decay'] * local_learning_rates
         return local_learning_rates.sum().item()
 
     def _step_warp(
@@ -96,6 +96,9 @@ class AdagradOptimizer(LightFMOptimizer):
             user_id: int,
             positive_item_id: int,
             negative_item_id: int,
+            user_repr: SparseCSRTensorT,
+            pos_item_repr: SparseCSRTensorT,
+            neg_item_repr: SparseCSRTensorT,
     ):
         """
         Apply the gradient step.
@@ -104,20 +107,12 @@ class AdagradOptimizer(LightFMOptimizer):
         neg_item_feature_vector = item_features[negative_item_id]
         user_feature_vector = user_features[user_id]
 
-        # latent representation vector: p x n_components
-        pos_item_repr = get_representation(
-            pos_item_feature_vector, self.params['item_embeddings'], self.params['item_scale'])
-        neg_item_repr = get_representation(
-            neg_item_feature_vector, self.params['item_embeddings'], self.params['item_scale'])
-        user_repr = get_representation(
-            user_feature_vector, self.params['user_embeddings'], self.params['user_scale'])
-
-        pos_item_feature_index = pos_item_feature_vector.indices().squeeze()
-        pos_item_feature_weights = pos_item_feature_vector.values().unsqueeze(1)
-        neg_item_feature_index = neg_item_feature_vector.indices().squeeze()
-        neg_item_feature_weights = neg_item_feature_vector.values().unsqueeze(1)
-        user_feature_index = user_feature_vector.indices().squeeze()
-        user_feature_weights = user_feature_vector.values().unsqueeze(1)
+        pos_item_feature_index = pos_item_feature_vector.indices().view(-1)
+        pos_item_feature_weights = pos_item_feature_vector.values().view(-1, 1)
+        neg_item_feature_index = neg_item_feature_vector.indices().view(-1)
+        neg_item_feature_weights = neg_item_feature_vector.values().view(-1, 1)
+        user_feature_index = user_feature_vector.indices().view(-1)
+        user_feature_weights = user_feature_vector.values().view(-1, 1)
         del pos_item_feature_vector, neg_item_feature_vector, user_feature_vector
 
         # Update latent bias terms
@@ -155,8 +150,8 @@ class AdagradOptimizer(LightFMOptimizer):
 
         # Update the scaling factors for lazy regularization, using the average learning rate
         # of features updated for this example.
-        self.params['item_scale'].mul_(1.0 + self.defaults['weight_decay'] * avg_learning_rate)
-        self.params['user_scale'].mul_(1.0 + self.defaults['weight_decay'] * avg_learning_rate)
+        self.params['item_scale'] *= 1.0 + self.defaults['weight_decay'] * avg_learning_rate
+        self.params['user_scale'] *= 1.0 + self.defaults['weight_decay'] * avg_learning_rate
 
     @pt.no_grad()
     def step(
@@ -166,9 +161,33 @@ class AdagradOptimizer(LightFMOptimizer):
             item_features: SparseCSRTensorT,
             user_id: int,
             positive_item_id: int,
-            negative_item_id: int
+            negative_item_id: int,
+            user_repr: SparseCSRTensorT,
+            pos_item_repr: SparseCSRTensorT,
+            neg_item_repr: SparseCSRTensorT,
     ):
         """Apply Adagrad learning rule"""
         # For now only WARP updates are supported
-        self._step_warp(
-            loss, user_features, item_features, user_id, positive_item_id, negative_item_id)
+        self._step_warp(loss, user_features, item_features, user_id, positive_item_id,
+                        negative_item_id, user_repr, pos_item_repr, neg_item_repr)
+
+    @pt.no_grad()
+    def step_batch(
+            self,
+            losses: pt.Tensor,
+            user_features: SparseCSRTensorT,
+            item_features: SparseCSRTensorT,
+            user_ids: int,
+            positive_item_ids: int,
+            negative_item_ids: int,
+            user_reprs: pt.Tensor,
+            pos_item_reprs: pt.Tensor,
+            neg_item_reprs: pt.Tensor,
+    ):
+        """Apply Adagrad learning rule"""
+        # For now only WARP updates are supported
+        for idx in range(losses.shape[0]):
+            self._step_warp(
+                losses[idx], user_features, item_features,
+                user_ids[idx], positive_item_ids[idx], negative_item_ids[idx],
+                user_reprs[idx], pos_item_reprs[idx], neg_item_reprs[idx],)
