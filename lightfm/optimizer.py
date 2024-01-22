@@ -1,5 +1,6 @@
 import typing as t
 from collections import defaultdict
+from math import log as lognat
 
 import torch as pt
 
@@ -9,6 +10,12 @@ __all__ = [
     'AdagradOptimizer',
     'LightFMOptimizer',
 ]
+
+MAX_LOSS = 10.0
+
+
+def warp_loss(rank: int, weight: pt.Tensor, n_items: int) -> pt.Tensor:
+    return (weight * lognat(max(1.0, (n_items - 1) // rank))).clip_(max=MAX_LOSS)
 
 
 def get_representation(
@@ -94,13 +101,13 @@ class AdagradOptimizer(LightFMOptimizer):
             loss: pt.Tensor
     ) -> float:
         # Update first gradient moments
-        gradients = self.state[param_name]['gradients'][feature_index]
-        local_learning_rates = self.defaults['lr'] / gradients.sqrt()
-        gradients += (loss * feature_weights) ** 2
+        gradients = self.state[param_name]['gradients']
+        local_learning_rates = self.defaults['lr'] / gradients[feature_index].sqrt()
+        gradients[feature_index] += (loss * feature_weights) ** 2
         # Update parameter and scale using regularization parameter
-        param = self.params[param_name][feature_index]
-        param -= local_learning_rates * loss * feature_weights
-        param *= 1.0 + self.defaults['weight_decay'] * local_learning_rates
+        param = self.params[param_name]
+        param[feature_index] -= local_learning_rates * loss * feature_weights
+        param[feature_index] *= 1.0 + self.defaults['weight_decay'] * local_learning_rates
         return local_learning_rates.sum().item()
 
     def _step_warp(
